@@ -780,8 +780,26 @@ def gols_1t(competidor: dict) -> Optional[int]:
     return _int(ls[0].get("value"))
 
 
+def gols_1t_por_lances(comp: dict, casa: dict, fora: dict) -> Optional[int]:
+    """Plano B: conta os gols até 45' (inclui acréscimos do 1T) na lista de lances."""
+    lances = comp.get("details")
+    if lances is None:
+        return None
+    gols = [d for d in lances if d.get("scoringPlay") and not d.get("shootout")]
+    if len(gols) != _int(casa.get("score")) + _int(fora.get("score")):
+        return None                      # lista incompleta: melhor não usar
+    n = 0
+    for d in gols:
+        nums = re.findall(r"\d+", (d.get("clock") or {}).get("displayValue", "") or "")
+        if not nums:
+            return None
+        if int(nums[0]) <= 45:
+            n += 1
+    return n
+
+
 def parse_passado(ev: dict) -> Optional[tuple]:
-    """Jogo terminado -> (data, id_casa, id_fora, gols_1t_casa, gols_1t_fora)."""
+    """Jogo terminado -> (data, id_casa, id_fora, total_de_gols_no_1T)."""
     try:
         comp = ev["competitions"][0]
         status = ev.get("status") or comp.get("status") or {}
@@ -796,9 +814,13 @@ def parse_passado(ev: dict) -> Optional[tuple]:
         if not casa or not fora:
             return None
         hc, hf = gols_1t(casa), gols_1t(fora)
-        if hc is None or hf is None:
-            return None
-        return (ev.get("date", ""), str(casa["team"]["id"]), str(fora["team"]["id"]), hc, hf)
+        if hc is not None and hf is not None:
+            total = hc + hf
+        else:
+            total = gols_1t_por_lances(comp, casa, fora)
+            if total is None:
+                return None
+        return (ev.get("date", ""), str(casa["team"]["id"]), str(fora["team"]["id"]), total)
     except (KeyError, IndexError, TypeError, AttributeError):
         return None
 
@@ -820,8 +842,7 @@ def carregar_historico(slug: str, memoria: dict) -> Optional[dict]:
         p = parse_passado(ev)
         if not p:
             continue
-        data, id_casa, id_fora, g_casa, g_fora = p
-        total = g_casa + g_fora
+        data, id_casa, id_fora, total = p
         brutos.setdefault(id_casa, []).append((data, total))
         brutos.setdefault(id_fora, []).append((data, total))
 
@@ -842,24 +863,30 @@ def hora_local(iso: str) -> str:
         return "--:--"
 
 
-def montar_prelive(slug: str, memoria: dict) -> Optional[str]:
-    """Texto do pré-live de UMA liga (None se não há jogos por começar hoje)."""
-    dados = get_espn(f"{slug}/scoreboard")
+def montar_prelive(slug: str, memoria: dict, dia: Optional[str] = None) -> Optional[str]:
+    """Texto do pré-live de UMA liga (None se não há jogos por começar).
+    dia = 'AAAAMMDD' para outra data (ex.: amanhã); None = hoje."""
+    diag = memoria.setdefault("diag", {})          # guarda o que aconteceu, para explicar ao usuário
+    dados = get_espn(f"{slug}/scoreboard" + (f"?dates={dia}" if dia else ""))
     if dados is None:
+        diag[slug] = (slug, 0, 0, False)
         return None
     ligas = dados.get("leagues") or [{}]
     rotulo = ligas[0].get("name") or ligas[0].get("abbreviation") or slug
-    jogos = []
+    todos = []
     for ev in dados.get("events", []):
         j = parse_evento(ev, slug, rotulo)
-        if j and j.estado == "pre":
-            jogos.append(j)
+        if j:
+            todos.append(j)
+    jogos = [j for j in todos if j.estado == "pre"]
+    diag[slug] = (rotulo, len(todos), len(jogos), True)
     if not jogos:
         return None
+    sufixo = " (amanhã)" if dia else ""
 
     hist = carregar_historico(slug, memoria)
     if hist is None:
-        return f"🔮 <b>PRÉ-LIVE — {esc(rotulo)}</b>\nNão consegui o histórico agora. Tente de novo em instantes."
+        return f"🔮 <b>PRÉ-LIVE — {esc(rotulo)}{sufixo}</b>\nNão consegui o histórico agora. Tente de novo em instantes."
 
     linhas, sem_dados = [], 0
     for j in jogos:
@@ -873,9 +900,13 @@ def montar_prelive(slug: str, memoria: dict) -> Optional[str]:
         linhas.append(((ma + mb) / 2, (pa + pb) / 2, j, ma, mb, pa, pb))
     linhas.sort(key=lambda x: (x[0], x[1]), reverse=True)
 
-    out = [f"🔮 <b>PRÉ-LIVE — {esc(rotulo)}</b>", "Chance de gol no 1º tempo", ""]
+    log.info("Pré-live %s: %d jogo(s) por começar, %d com histórico suficiente (%d times com dados).",
+             slug, len(jogos), len(linhas), len(hist))
+    out = [f"🔮 <b>PRÉ-LIVE — {esc(rotulo)}{sufixo}</b>", "Chance de gol no 1º tempo", ""]
     if not linhas:
-        out.append(f"Sem dados suficientes para {sem_dados} jogo(s) de hoje.")
+        out.append("Sem histórico suficiente de gols no 1T para ranquear. Jogos por começar:")
+        for j in jogos[:10]:
+            out.append(f"• {esc(j.mandante)} x {esc(j.visitante)} · {hora_local(j.inicio)}")
         return "\n".join(out)
     for i, (media, pct, j, ma, mb, pa, pb) in enumerate(linhas[:PRELIVE_TOP], 1):
         out.append(f"<b>{i}. {esc(j.mandante)} x {esc(j.visitante)}</b> · {hora_local(j.inicio)}")
@@ -887,11 +918,12 @@ def montar_prelive(slug: str, memoria: dict) -> Optional[str]:
     return "\n".join(out)
 
 
-def enviar_prelive(memoria: dict) -> None:
+def enviar_prelive(memoria: dict, dia: Optional[str] = None) -> None:
+    memoria["diag"] = {}
     enviados = 0
     for slug in LIGAS:
         try:
-            texto = montar_prelive(slug, memoria)
+            texto = montar_prelive(slug, memoria, dia)
         except Exception:
             log.exception("Erro no pré-live de %s", slug)
             continue
@@ -900,8 +932,23 @@ def enviar_prelive(memoria: dict) -> None:
             enviados += 1
         time.sleep(PAUSA_ENTRE_REQUISICOES)
     if enviados == 0:
-        enviar_telegram("🔮 Nenhum jogo por começar hoje nas ligas monitoradas "
-                        "(ou sem dados no momento).")
+        quando = "amanhã" if dia else "hoje"
+        linhas = [f"🔮 Nenhum jogo por começar {quando} nas ligas monitoradas.", "", "Situação por liga:"]
+        sem_resposta = 0
+        for slug in LIGAS:
+            rot, tot, pre, ok = memoria["diag"].get(slug, (slug, 0, 0, False))
+            if not ok:
+                sem_resposta += 1
+                linhas.append(f"• {esc(slug)}: ⚠️ sem resposta da ESPN")
+            elif tot == 0:
+                linhas.append(f"• {esc(rot)}: sem jogos {quando}")
+            else:
+                linhas.append(f"• {esc(rot)}: {tot} jogo(s), todos já começaram ou terminaram")
+        if sem_resposta == len(LIGAS):
+            linhas += ["", "A ESPN não respondeu em nenhuma liga (possível bloqueio ou instabilidade)."]
+        elif not dia:
+            linhas += ["", "Dica: /prelive amanha mostra os jogos de amanhã."]
+        enviar_telegram("\n".join(linhas))
 
 
 def verificar_prelive_auto(estado: dict, memoria: dict) -> None:
@@ -943,8 +990,12 @@ def verificar_comandos(memoria: dict) -> None:
             continue
         texto = (msg.get("text") or "").strip().lower()
         if texto.startswith("/prelive"):
+            partes = texto.split()
+            dia = None
+            if len(partes) > 1 and partes[1] in ("amanha", "amanhã"):
+                dia = (agora() + timedelta(days=1)).strftime("%Y%m%d")
             enviar_telegram("🔎 Montando o pré-live, um instante...")
-            enviar_prelive(memoria)
+            enviar_prelive(memoria, dia)
     if primeira and memoria.get("offset") is None:
         memoria["offset"] = 0
 
@@ -1006,7 +1057,7 @@ def main() -> None:
         f"Relatório diário: {RELATORIO_HORA:02d}:{RELATORIO_MIN_INICIO:02d}"
         f"–{RELATORIO_HORA:02d}:{RELATORIO_MIN_FIM:02d}\n"
         "Alerta ao vivo: 🔥 CHANCE DE GOL (jogo todo, até os acréscimos)\n"
-        "Envie /prelive para ver os jogos de hoje com mais chance de gol no 1º tempo."
+        "Envie /prelive (ou /prelive amanha) para ver os jogos com mais chance de gol no 1º tempo."
     )
     log.info("Bot rodando. Ctrl+C para parar.")
 
