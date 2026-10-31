@@ -69,13 +69,25 @@ RELATORIO_MIN_INICIO = 0
 RELATORIO_MIN_FIM = 30   # exclusivo: vale de 11:00 até 11:29
 
 ARQUIVO_ESTADO = os.getenv("ARQUIVO_ESTADO", "estado_bot.json")
-ESPN = "https://site.api.espn.com/apis/site/v2/sports/soccer"
+# A ESPN tem mais de um endereço; se um bloquear (HTTP 403), tentamos o outro.
+ESPN_HOSTS = [
+    "https://site.api.espn.com/apis/site/v2/sports/soccer",
+    "https://site.web.api.espn.com/apis/site/v2/sports/soccer",
+]
+_host_preferido = 0
 
 logging.basicConfig(format="%(asctime)s | %(levelname)-7s | %(message)s", level=logging.INFO)
 log = logging.getLogger("bot-futebol")
 
 SESSAO = requests.Session()  # reaproveita a conexão (menos latência)
-SESSAO.headers.update({"User-Agent": "Mozilla/5.0 (bot-futebol)", "Accept": "application/json"})
+SESSAO.headers.update({
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                   "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.espn.com/",
+    "Origin": "https://www.espn.com",
+})
 
 try:
     TZ = ZoneInfo(TIMEZONE) if ZoneInfo else None
@@ -183,6 +195,19 @@ def get_json(url: str) -> Optional[dict]:
     return None
 
 
+def get_espn(caminho: str) -> Optional[dict]:
+    """Consulta a ESPN tentando os hosts disponíveis (lembra qual funcionou)."""
+    global _host_preferido
+    n = len(ESPN_HOSTS)
+    for i in range(n):
+        idx = (_host_preferido + i) % n
+        dados = get_json(f"{ESPN_HOSTS[idx]}/{caminho}")
+        if dados is not None:
+            _host_preferido = idx
+            return dados
+    return None
+
+
 @dataclass
 class Jogo:
     id: str
@@ -242,15 +267,14 @@ def parse_evento(ev: dict, slug: str, rotulo: str) -> Optional[Jogo]:
         return None
 
 
-def buscar_jogos() -> tuple[dict, bool]:
-    """Consulta todas as ligas. Devolve ({id: Jogo}, todas_ok)."""
+def buscar_jogos() -> tuple[dict, int]:
+    """Consulta todas as ligas. Devolve ({id: Jogo}, quantas_ligas_responderam)."""
     jogos: dict = {}
-    todas_ok = True
+    n_ok = 0
     for slug in LIGAS:
-        dados = get_json(f"{ESPN}/{slug}/scoreboard")
-        if dados is None:
-            todas_ok = False
-        else:
+        dados = get_espn(f"{slug}/scoreboard")
+        if dados is not None:
+            n_ok += 1
             ligas = dados.get("leagues") or [{}]
             rotulo = ligas[0].get("abbreviation") or ligas[0].get("name") or slug
             for ev in dados.get("events", []):
@@ -258,12 +282,12 @@ def buscar_jogos() -> tuple[dict, bool]:
                 if j:
                     jogos[j.id] = j
         time.sleep(PAUSA_ENTRE_REQUISICOES)  # respeita o rate limit
-    return jogos, todas_ok
+    return jogos, n_ok
 
 
 def buscar_total_final(sinal: dict) -> Optional[int]:
     """Plano B: pergunta o resultado final de um jogo que saiu do placar do dia."""
-    dados = get_json(f"{ESPN}/{sinal['liga_slug']}/summary?event={sinal['event_id']}")
+    dados = get_espn(f"{sinal['liga_slug']}/summary?event={sinal['event_id']}")
     if not dados:
         return None
     try:
@@ -448,8 +472,23 @@ def detectar_eventos(j: Jogo, estado: dict, memoria: dict) -> None:
 
 def ciclo(estado: dict, memoria: dict) -> bool:
     """Uma rodada completa. Devolve True se há jogos ao vivo."""
-    jogos, todas_ok = buscar_jogos()
+    jogos, n_ok = buscar_jogos()
+    todas_ok = n_ok == len(LIGAS)
     ao_vivo = [j for j in jogos.values() if j.estado == "in"]
+
+    # Se NENHUMA liga responde por muitas rodadas seguidas, avisa uma vez no Telegram.
+    if n_ok == 0:
+        memoria["rodadas_sem_dados"] = memoria.get("rodadas_sem_dados", 0) + 1
+        if memoria["rodadas_sem_dados"] >= 10 and not memoria.get("aviso_api"):
+            memoria["aviso_api"] = True
+            enviar_telegram("⚠️ <b>Sem dados da ESPN</b> há várias rodadas "
+                            "(possível bloqueio HTTP 403 ou instabilidade). "
+                            "Sem dados, o bot não consegue enviar alertas.")
+    else:
+        if memoria.get("aviso_api"):
+            enviar_telegram("✅ Dados da ESPN voltaram ao normal.")
+        memoria["rodadas_sem_dados"] = 0
+        memoria["aviso_api"] = False
 
     for j in ao_vivo:
         try:
