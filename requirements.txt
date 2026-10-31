@@ -1,2 +1,2 @@
-Pedidos>=2,31
-Dados
+requests>=2.31
+tzdata
