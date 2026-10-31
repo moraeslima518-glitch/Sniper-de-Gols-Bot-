@@ -27,11 +27,13 @@ import html
 import json
 import logging
 import os
+import re
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 
 import requests
@@ -67,6 +69,27 @@ PAUSA_ENTRE_REQUISICOES = 0.3                                       # s, entre l
 RELATORIO_HORA = 11
 RELATORIO_MIN_INICIO = 0
 RELATORIO_MIN_FIM = 30   # exclusivo: vale de 11:00 até 11:29
+
+# Alerta "CHANCE DE GOL" ao vivo (pressão no jogo)
+ALERTA_PRESSAO = os.getenv("ALERTA_PRESSAO", "1") == "1"
+PRESS_MIN_MIN = int(os.getenv("PRESS_MIN_MIN", "1"))         # a partir de que minuto (1 = jogo todo)
+PRESS_MAX_MIN = int(os.getenv("PRESS_MAX_MIN", "130"))       # até que minuto (130 = inclui acréscimos)
+PRESS_MAX_POR_JOGO = int(os.getenv("PRESS_MAX_POR_JOGO", "2"))  # máx. de alertas por jogo
+PRESS_INTERVALO = int(os.getenv("PRESS_INTERVALO", "10"))    # min. de espera entre alertas do mesmo jogo
+PRESS_JANELA = int(os.getenv("PRESS_JANELA", "10"))          # últimos N minutos analisados
+PRESS_FINALIZACOES = int(os.getenv("PRESS_FINALIZACOES", "4"))  # mín. finalizações (2 times) na janela
+PRESS_NO_ALVO = int(os.getenv("PRESS_NO_ALVO", "2"))         # mín. finalizações no alvo na janela
+PRESS_CANTOS = int(os.getenv("PRESS_CANTOS", "2"))           # mín. cantos na janela
+PRESS_SEM_GOL = int(os.getenv("PRESS_SEM_GOL", "3"))         # sem gol nos últimos N minutos
+PRESS_DIF_MAX = int(os.getenv("PRESS_DIF_MAX", "1"))         # diferença máxima no placar
+
+# Pré-live (gols no 1º tempo)
+PRELIVE_AUTO = os.getenv("PRELIVE_AUTO", "1") == "1"      # envia sozinho 1x por dia
+PRELIVE_HORA = int(os.getenv("PRELIVE_HORA", "9"))        # janela HH:00 a HH:29
+PRELIVE_TOP = int(os.getenv("PRELIVE_TOP", "3"))          # jogos por liga
+HIST_DIAS = int(os.getenv("HIST_DIAS", "45"))             # quantos dias olhar para trás
+HIST_JOGOS = int(os.getenv("HIST_JOGOS", "10"))           # últimos N jogos de cada time
+MIN_JOGOS_HIST = int(os.getenv("MIN_JOGOS_HIST", "4"))    # mínimo de jogos para entrar no ranking
 
 ARQUIVO_ESTADO = os.getenv("ARQUIVO_ESTADO", "estado_bot.json")
 # A ESPN tem mais de um endereço; se um bloquear (HTTP 403), tentamos o outro.
@@ -146,6 +169,8 @@ def estado_inicial() -> dict:
         "sinais": [],               # lista de sinais (ver registrar_sinal)
         "totais": {"green": 0, "red": 0},
         "ultimo_relatorio": "",     # data AAAA-MM-DD do último relatório enviado
+        "ultimo_prelive": "",       # data AAAA-MM-DD do último pré-live automático
+        "pressao_ids": {},          # jogos que já receberam alerta de chance de gol
     }
 
 
@@ -222,6 +247,8 @@ class Jogo:
     gols_mandante: int
     gols_visitante: int
     detalhes: list = field(default_factory=list)
+    inicio: str = ""       # data/hora de início (ISO, UTC)
+    descricao: str = ""    # ex.: "Halftime", "Second Half"
 
     @property
     def total(self) -> int:
@@ -262,6 +289,8 @@ def parse_evento(ev: dict, slug: str, rotulo: str) -> Optional[Jogo]:
             gols_mandante=_int(casa.get("score")),
             gols_visitante=_int(fora.get("score")),
             detalhes=comp.get("details") or [],
+            inicio=ev.get("date", "") or "",
+            descricao=status.get("type", {}).get("description", "") or "",
         )
     except (KeyError, IndexError, TypeError, AttributeError):
         return None
@@ -360,7 +389,7 @@ def registrar_sinal(estado: dict, j: Jogo, tipo: str, minuto: str) -> None:
     estado["sinais"].append({
         "event_id": j.id,
         "liga_slug": j.liga_slug,
-        "tipo": tipo,                       # "gol" | "vermelho"
+        "tipo": tipo,                       # "gol" | "vermelho" | "pressao"
         "jogo": f"{j.mandante} x {j.visitante}",
         "minuto": minuto,
         "total_no_alerta": j.total,         # gols no momento do alerta
@@ -496,16 +525,177 @@ def ciclo(estado: dict, memoria: dict) -> bool:
         except Exception:  # um jogo com dados estranhos não derruba os outros
             log.exception("Erro processando o jogo %s", j.id)
 
+    if ALERTA_PRESSAO:
+        try:
+            monitorar_pressao(ao_vivo, estado, memoria)
+        except Exception:
+            log.exception("Erro no alerta de chance de gol.")
+
     resolver_sinais(estado, jogos)
 
     # Limpa memória de jogos que acabaram (só se todas as ligas responderam).
     if todas_ok:
         ids_vivos = {j.id for j in ao_vivo}
-        for chave in ("ultimo", "cartoes"):
-            for mid in list(memoria[chave]):
+        for chave in ("ultimo", "cartoes", "snaps", "gol_min", "total_ant"):
+            store = memoria.setdefault(chave, {})
+            for mid in list(store):
                 if mid not in ids_vivos:
-                    memoria[chave].pop(mid, None)
+                    store.pop(mid, None)
     return bool(ao_vivo)
+
+
+# ==========================================================================
+# 7b) CHANCE DE GOL AO VIVO (pressão: finalizações + cantos nos últimos minutos)
+# ==========================================================================
+# Regra (todas precisam bater):
+#   - jogo todo: do minuto 1 aos acréscimos (PRESS_MIN_MIN a PRESS_MAX_MIN)
+#   - placar empatado ou com diferença <= PRESS_DIF_MAX
+#   - nos últimos PRESS_JANELA minutos (ou desde o apito inicial, se o jogo
+#     tem menos que isso): finalizações, finalizações no alvo e cantos
+#     (somando os dois times) >= os mínimos configurados
+#   - sem gol nos últimos PRESS_SEM_GOL minutos
+#   - no máximo PRESS_MAX_POR_JOGO alertas por jogo, com PRESS_INTERVALO min entre eles
+# O alerta entra na contagem de greens/reds (green = saiu mais 1 gol depois).
+
+NOMES_FINALIZACOES = {"totalShots", "shots"}
+NOMES_NO_ALVO = {"shotsOnTarget", "shotsOnGoal"}
+NOMES_CANTOS = {"wonCorners", "cornerKicks"}
+
+
+def minuto_num(relogio: str) -> Optional[int]:
+    """'67\'' -> 67 ; '90\'+3\'' -> 93."""
+    nums = [int(x) for x in re.findall(r"\d+", relogio or "")]
+    return sum(nums[:2]) if nums else None
+
+
+def _num(v: Any) -> int:
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return 0
+
+
+def buscar_stats(j: Jogo) -> Optional[dict]:
+    """Estatísticas acumuladas por time: {id_time: {'f': finalizações, 'a': no alvo, 'c': cantos}}."""
+    try:
+        dados = get_espn(f"{j.liga_slug}/summary?event={j.id}")
+        if not dados:
+            return None
+        out = {}
+        for t in dados.get("boxscore", {}).get("teams", []):
+            tid = str(t.get("team", {}).get("id", ""))
+            reg = {"f": 0, "a": 0, "c": 0}
+            for st in t.get("statistics", []):
+                nome = st.get("name")
+                val = _num(st.get("displayValue", st.get("value")))
+                if nome in NOMES_FINALIZACOES:
+                    reg["f"] = val
+                elif nome in NOMES_NO_ALVO:
+                    reg["a"] = val
+                elif nome in NOMES_CANTOS:
+                    reg["c"] = val
+            out[tid] = reg
+        if j.id_mandante in out and j.id_visitante in out:
+            return out
+    except (KeyError, TypeError, AttributeError):
+        pass
+    return None
+
+
+def msg_pressao(j: Jogo, minuto: int, d: dict, pressiona: str, janela: int) -> str:
+    return "\n".join([
+        f"🔥 <b>CHANCE DE GOL</b> — {esc(j.liga)}",
+        placar(j),
+        f"⏱ {minuto}'",
+        f"📊 Últimos {janela} min: <b>{d['f']}</b> finalizações ({d['a']} no alvo) · <b>{d['c']}</b> cantos",
+        f"⚡ Pressão: {esc(pressiona)}",
+        f"🎯 Referência: mais 1 gol (over {j.total}.5)",
+    ])
+
+
+def monitorar_pressao(ao_vivo: list, estado: dict, memoria: dict) -> None:
+    snaps = memoria.setdefault("snaps", {})
+    gol_min = memoria.setdefault("gol_min", {})
+    total_ant = memoria.setdefault("total_ant", {})
+    ids_sinal = estado.setdefault("pressao_ids", {})
+    agora_ts = time.time()
+    for k, v in list(ids_sinal.items()):          # compatível com o formato antigo
+        if not isinstance(v, dict):
+            ids_sinal[k] = {"n": 1, "ts": v}
+    for k in [k for k, v in ids_sinal.items() if agora_ts - v["ts"] > 86400]:
+        ids_sinal.pop(k, None)
+
+    candidatos = []
+    for j in ao_vivo:
+        m = minuto_num(j.relogio)
+        if m is None:
+            continue
+        ant = total_ant.get(j.id)
+        if ant is not None and j.total != ant:
+            gol_min[j.id] = m                      # lembra o minuto do último gol
+        total_ant[j.id] = j.total
+        if j.descricao.strip().lower() == "halftime":
+            continue
+        info = ids_sinal.get(j.id)
+        if info and info["n"] >= PRESS_MAX_POR_JOGO:
+            continue
+        if m <= PRESS_MAX_MIN:                     # coleta desde o início para ter a "base"
+            candidatos.append((j, m))
+    if not candidatos:
+        return
+
+    with ThreadPoolExecutor(max_workers=6) as ex:       # jogos consultados em paralelo
+        resultados = list(ex.map(lambda c: buscar_stats(c[0]), candidatos))
+
+    for (j, m), st in zip(candidatos, resultados):
+        if not st:
+            continue
+        h, a = st[j.id_mandante], st[j.id_visitante]
+        snap = (m, h["f"], a["f"], h["a"], a["a"], h["c"], a["c"])
+        lista = snaps.setdefault(j.id, [])
+        if not lista or lista[-1] != snap:
+            lista.append(snap)
+
+        if sum(snap[1:]) == 0 and m >= PRESS_MIN_MIN and not memoria.get("aviso_stats"):
+            memoria["aviso_stats"] = True
+            log.warning("ESPN sem estatísticas no jogo %s x %s.", j.mandante, j.visitante)
+            enviar_telegram("⚠️ A ESPN não trouxe finalizações/cantos para um jogo ao vivo. "
+                            "Sem essas estatísticas o alerta de CHANCE DE GOL não dispara nesse jogo.")
+            continue
+
+        # ---- condições ----
+        if not (PRESS_MIN_MIN <= m <= PRESS_MAX_MIN):
+            continue
+        if abs(j.gols_mandante - j.gols_visitante) > PRESS_DIF_MAX:
+            continue
+        ult = gol_min.get(j.id)
+        if ult is not None and m - ult < PRESS_SEM_GOL:
+            continue
+        info = ids_sinal.get(j.id)
+        if info and agora_ts - info["ts"] < PRESS_INTERVALO * 60:
+            continue                                  # alerta recente neste jogo
+        bases = [x for x in lista if x[0] <= m - (PRESS_JANELA - 2)]
+        if bases:
+            base = bases[-1]
+            if m - base[0] > PRESS_JANELA + 5:
+                continue                              # base antiga demais (falha de dados)
+        elif m <= PRESS_JANELA:
+            base = (0, 0, 0, 0, 0, 0, 0)              # início do jogo: tudo zerado
+        else:
+            continue                                  # ainda sem histórico suficiente
+        dh_f, da_f = snap[1] - base[1], snap[2] - base[2]
+        d = {
+            "f": dh_f + da_f,
+            "a": (snap[3] - base[3]) + (snap[4] - base[4]),
+            "c": (snap[5] - base[5]) + (snap[6] - base[6]),
+        }
+        if d["f"] < PRESS_FINALIZACOES or d["a"] < PRESS_NO_ALVO or d["c"] < PRESS_CANTOS:
+            continue
+
+        pressiona = j.mandante if dh_f > da_f else j.visitante if da_f > dh_f else "os dois times"
+        ids_sinal[j.id] = {"n": (info["n"] if info else 0) + 1, "ts": agora_ts}
+        registrar_sinal(estado, j, "pressao", f"{m}'")   # salva o estado também
+        enviar_telegram(msg_pressao(j, m, d, pressiona, max(1, m - base[0])))
 
 
 # ==========================================================================
@@ -537,7 +727,7 @@ def montar_relatorio(estado: dict, data_txt: str) -> tuple[str, list]:
         linhas.append("<b>Detalhes:</b>")
         for s in resolvidos[:40]:
             icone = "✅" if s["status"] == "green" else "❌"
-            tipo = "Gol" if s["tipo"] == "gol" else "Vermelho"
+            tipo = {"gol": "Gol", "vermelho": "Vermelho", "pressao": "Chance de gol"}.get(s["tipo"], s["tipo"])
             linhas.append(
                 f"{icone} {esc(s['jogo'])} — {tipo} aos {esc(s['minuto'])} "
                 f"(alerta {s['placar_no_alerta']}, final {s['total_final']} gols no total)"
@@ -569,6 +759,194 @@ def verificar_relatorio(estado: dict) -> None:
         log.info("Relatório diário enviado.")
     else:
         log.warning("Relatório não enviado; tento de novo na próxima rodada (até 11:30).")
+
+
+# ==========================================================================
+# 8b) PRÉ-LIVE: jogos de hoje com mais chance de gol no 1º TEMPO
+# ==========================================================================
+# Método (simples e transparente): para cada time, olhamos os últimos jogos
+# já terminados e contamos os gols marcados no 1º tempo (pelos DOIS lados).
+# Para cada jogo de hoje, fazemos a média dos dois times. Quanto maior, mais
+# "aberto" costuma ser o 1º tempo. É estatística de histórico, NÃO é garantia.
+
+def gols_1t(competidor: dict) -> Optional[int]:
+    """Gols do 1º tempo de um competidor de jogo terminado (None se não houver dado)."""
+    ls = competidor.get("linescores") or []
+    if len(ls) < 2:               # precisa de pelo menos 2 períodos (1T e 2T)
+        return None
+    for item in ls:
+        if item.get("period") == 1:
+            return _int(item.get("value"))
+    return _int(ls[0].get("value"))
+
+
+def parse_passado(ev: dict) -> Optional[tuple]:
+    """Jogo terminado -> (data, id_casa, id_fora, gols_1t_casa, gols_1t_fora)."""
+    try:
+        comp = ev["competitions"][0]
+        status = ev.get("status") or comp.get("status") or {}
+        if status.get("type", {}).get("state") != "post":
+            return None
+        casa = fora = None
+        for c in comp.get("competitors", []):
+            if c.get("homeAway") == "home":
+                casa = c
+            elif c.get("homeAway") == "away":
+                fora = c
+        if not casa or not fora:
+            return None
+        hc, hf = gols_1t(casa), gols_1t(fora)
+        if hc is None or hf is None:
+            return None
+        return (ev.get("date", ""), str(casa["team"]["id"]), str(fora["team"]["id"]), hc, hf)
+    except (KeyError, IndexError, TypeError, AttributeError):
+        return None
+
+
+def carregar_historico(slug: str, memoria: dict) -> Optional[dict]:
+    """{id_time: [gols_totais_no_1T dos últimos jogos]}; guardado em cache por dia."""
+    hoje = agora().strftime("%Y%m%d")
+    cache = memoria.setdefault("hist", {})
+    if slug in cache and cache[slug][0] == hoje:
+        return cache[slug][1]
+
+    ini = (agora() - timedelta(days=HIST_DIAS)).strftime("%Y%m%d")
+    dados = get_espn(f"{slug}/scoreboard?dates={ini}-{hoje}&limit=500")
+    if dados is None:
+        return None
+
+    brutos: dict = {}
+    for ev in dados.get("events", []):
+        p = parse_passado(ev)
+        if not p:
+            continue
+        data, id_casa, id_fora, g_casa, g_fora = p
+        total = g_casa + g_fora
+        brutos.setdefault(id_casa, []).append((data, total))
+        brutos.setdefault(id_fora, []).append((data, total))
+
+    times = {}
+    for tid, lista in brutos.items():
+        lista.sort(reverse=True)                       # mais recentes primeiro
+        times[tid] = [t for _, t in lista[:HIST_JOGOS]]
+    cache[slug] = (hoje, times)
+    return times
+
+
+def hora_local(iso: str) -> str:
+    try:
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        dt = dt.astimezone(TZ) if TZ else dt.astimezone()
+        return dt.strftime("%H:%M")
+    except (ValueError, AttributeError):
+        return "--:--"
+
+
+def montar_prelive(slug: str, memoria: dict) -> Optional[str]:
+    """Texto do pré-live de UMA liga (None se não há jogos por começar hoje)."""
+    dados = get_espn(f"{slug}/scoreboard")
+    if dados is None:
+        return None
+    ligas = dados.get("leagues") or [{}]
+    rotulo = ligas[0].get("name") or ligas[0].get("abbreviation") or slug
+    jogos = []
+    for ev in dados.get("events", []):
+        j = parse_evento(ev, slug, rotulo)
+        if j and j.estado == "pre":
+            jogos.append(j)
+    if not jogos:
+        return None
+
+    hist = carregar_historico(slug, memoria)
+    if hist is None:
+        return f"🔮 <b>PRÉ-LIVE — {esc(rotulo)}</b>\nNão consegui o histórico agora. Tente de novo em instantes."
+
+    linhas, sem_dados = [], 0
+    for j in jogos:
+        a, b = hist.get(j.id_mandante, []), hist.get(j.id_visitante, [])
+        if len(a) < MIN_JOGOS_HIST or len(b) < MIN_JOGOS_HIST:
+            sem_dados += 1
+            continue
+        ma, mb = sum(a) / len(a), sum(b) / len(b)
+        pa = sum(1 for x in a if x >= 1) / len(a) * 100
+        pb = sum(1 for x in b if x >= 1) / len(b) * 100
+        linhas.append(((ma + mb) / 2, (pa + pb) / 2, j, ma, mb, pa, pb))
+    linhas.sort(key=lambda x: (x[0], x[1]), reverse=True)
+
+    out = [f"🔮 <b>PRÉ-LIVE — {esc(rotulo)}</b>", "Chance de gol no 1º tempo", ""]
+    if not linhas:
+        out.append(f"Sem dados suficientes para {sem_dados} jogo(s) de hoje.")
+        return "\n".join(out)
+    for i, (media, pct, j, ma, mb, pa, pb) in enumerate(linhas[:PRELIVE_TOP], 1):
+        out.append(f"<b>{i}. {esc(j.mandante)} x {esc(j.visitante)}</b> · {hora_local(j.inicio)}")
+        out.append(f"   Média de gols no 1T: <b>{media:.2f}</b> ({ma:.1f} | {mb:.1f})")
+        out.append(f"   Jogos com gol no 1T: {pa:.0f}% | {pb:.0f}%")
+    out.append("")
+    out.append(f"ℹ️ Base: últimos {HIST_JOGOS} jogos de cada time. Estatística, não garantia."
+               + (f" ({sem_dados} jogo(s) sem dados suficientes)" if sem_dados else ""))
+    return "\n".join(out)
+
+
+def enviar_prelive(memoria: dict) -> None:
+    enviados = 0
+    for slug in LIGAS:
+        try:
+            texto = montar_prelive(slug, memoria)
+        except Exception:
+            log.exception("Erro no pré-live de %s", slug)
+            continue
+        if texto:
+            enviar_telegram(texto)
+            enviados += 1
+        time.sleep(PAUSA_ENTRE_REQUISICOES)
+    if enviados == 0:
+        enviar_telegram("🔮 Nenhum jogo por começar hoje nas ligas monitoradas "
+                        "(ou sem dados no momento).")
+
+
+def verificar_prelive_auto(estado: dict, memoria: dict) -> None:
+    if not PRELIVE_AUTO:
+        return
+    agora_ = agora()
+    hoje = agora_.strftime("%Y-%m-%d")
+    if agora_.hour != PRELIVE_HORA or agora_.minute >= 30:
+        return
+    if estado.get("ultimo_prelive") == hoje:
+        return
+    estado["ultimo_prelive"] = hoje      # marca antes: evita repetir se der erro no meio
+    salvar_estado(estado)
+    enviar_prelive(memoria)
+
+
+def verificar_comandos(memoria: dict) -> None:
+    """Lê mensagens novas do Telegram. Atende /prelive só do seu CHAT_ID."""
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    primeira = memoria.get("offset") is None
+    params = {"timeout": 0, "allowed_updates": json.dumps(["message"])}
+    if not primeira:
+        params["offset"] = memoria["offset"]
+    try:
+        r = SESSAO.get(url, params=params, timeout=10)
+        if r.status_code != 200:
+            return
+        resultado = r.json().get("result", [])
+    except (requests.RequestException, ValueError) as exc:
+        log.debug("getUpdates falhou (%s)", type(exc).__name__)
+        return
+
+    for upd in resultado:
+        memoria["offset"] = upd["update_id"] + 1
+        if primeira:                       # ignora mensagens antigas ao ligar
+            continue
+        msg = upd.get("message") or {}
+        if str((msg.get("chat") or {}).get("id")) != str(CHAT_ID):
+            continue
+        texto = (msg.get("text") or "").strip().lower()
+        if texto.startswith("/prelive"):
+            enviar_telegram("🔎 Montando o pré-live, um instante...")
+            enviar_prelive(memoria)
+    if primeira and memoria.get("offset") is None:
+        memoria["offset"] = 0
 
 
 # ==========================================================================
@@ -619,14 +997,16 @@ def main() -> None:
 
     iniciar_servidor_saude()
     estado = carregar_estado()
-    memoria = {"ultimo": {}, "cartoes": {}}
+    memoria = {"ultimo": {}, "cartoes": {}, "hist": {}, "offset": None}
     falhas = 0
 
     enviar_telegram(
         "🤖 <b>Bot iniciado!</b>\n"
         f"Ligas monitoradas: {len(LIGAS)}\n"
         f"Relatório diário: {RELATORIO_HORA:02d}:{RELATORIO_MIN_INICIO:02d}"
-        f"–{RELATORIO_HORA:02d}:{RELATORIO_MIN_FIM:02d}"
+        f"–{RELATORIO_HORA:02d}:{RELATORIO_MIN_FIM:02d}\n"
+        "Alerta ao vivo: 🔥 CHANCE DE GOL (jogo todo, até os acréscimos)\n"
+        "Envie /prelive para ver os jogos de hoje com mais chance de gol no 1º tempo."
     )
     log.info("Bot rodando. Ctrl+C para parar.")
 
@@ -649,9 +1029,18 @@ def main() -> None:
             log.exception("Erro ao gerar o relatório diário.")
 
         try:
-            time.sleep(espera)
-        except KeyboardInterrupt:
-            raise
+            verificar_prelive_auto(estado, memoria)
+        except Exception:
+            log.exception("Erro no pré-live automático.")
+
+        # Dorme em fatias de 5s e, entre elas, escuta comandos do Telegram (/prelive).
+        fim = time.time() + espera
+        while time.time() < fim:
+            time.sleep(min(5.0, max(0.1, fim - time.time())))
+            try:
+                verificar_comandos(memoria)
+            except Exception:
+                log.exception("Erro lendo comandos do Telegram.")
 
 
 if __name__ == "__main__":
