@@ -90,6 +90,9 @@ PRELIVE_TOP = int(os.getenv("PRELIVE_TOP", "3"))          # jogos por liga
 HIST_DIAS = int(os.getenv("HIST_DIAS", "45"))             # quantos dias olhar para trás
 HIST_JOGOS = int(os.getenv("HIST_JOGOS", "10"))           # últimos N jogos de cada time
 MIN_JOGOS_HIST = int(os.getenv("MIN_JOGOS_HIST", "4"))    # mínimo de jogos para entrar no ranking
+# Ligas usadas SÓ para completar o histórico de times que jogam Champions/Europa (não geram alertas).
+HIST_EXTRA = [x.strip() for x in os.getenv(
+    "HIST_EXTRA", "ned.1,tur.1,gre.1,nor.1,aut.1,ukr.1,sco.1,bel.1,den.1,sui.1").split(",") if x.strip()]
 FATOR_1T = float(os.getenv("FATOR_1T", "0.45"))           # ~45% dos gols saem no 1T (usado só como estimativa)
 
 ARQUIVO_ESTADO = os.getenv("ARQUIVO_ESTADO", "estado_bot.json")
@@ -829,7 +832,7 @@ def parse_passado(ev: dict) -> Optional[tuple]:
 
 def carregar_historico(slug: str, memoria: dict) -> Optional[dict]:
     """Histórico recente de uma liga, em cache por dia:
-    {"1t": {id_time: [gols no 1T]}, "ft": {id_time: [gols no jogo todo]}}.
+    {"1t": {id_time: [(data, gols no 1T)]}, "ft": {id_time: [(data, gols no jogo todo)]}}.
     Busca do dia mais NOVO para o mais antigo, em blocos. Se a ESPN recusar (HTTP 400),
     tenta sem 'limit' e depois encolhe o bloco (o tamanho que funciona fica memorizado)."""
     hoje_dt = agora().date()
@@ -837,6 +840,10 @@ def carregar_historico(slug: str, memoria: dict) -> Optional[dict]:
     cache = memoria.setdefault("hist", {})
     if slug in cache and cache[slug][0] == hoje:
         return cache[slug][1]
+
+    if get_espn(f"{slug}/scoreboard") is None:         # liga inexistente/fora do ar: não mexe no bloco
+        memoria.setdefault("hist_info", {})[slug] = (0, 0, 0, 1, memoria.get("span", 10))
+        return None
 
     limite_antigo = hoje_dt - timedelta(days=HIST_DIAS)
     orcamento = 70                                     # máx. de consultas por liga
@@ -901,16 +908,51 @@ def carregar_historico(slug: str, memoria: dict) -> Optional[dict]:
     if not eventos:
         return None                                    # não guarda no cache: tenta de novo depois
 
-    def ultimos(brutos: dict) -> dict:
-        out = {}
-        for tid, lista in brutos.items():
-            lista.sort(reverse=True)                   # mais recentes primeiro
-            out[tid] = [t for _, t in lista[:HIST_JOGOS]]
-        return out
+    def ordenar(brutos: dict) -> dict:                 # [(data, gols)], mais recentes primeiro
+        return {tid: sorted(lista, reverse=True) for tid, lista in brutos.items()}
 
-    resultado = {"1t": ultimos(brutos_1t), "ft": ultimos(brutos_ft)}
+    resultado = {"1t": ordenar(brutos_1t), "ft": ordenar(brutos_ft)}
     cache[slug] = (hoje, resultado)
     return resultado
+
+
+def historico_para(memoria: dict, ids: set) -> tuple:
+    """Junta o histórico de várias ligas (um time joga a liga local E a Champions/Europa)
+    até cobrir todos os times de 'ids'. Devolve ({id: [gols 1T]}, {id: [gols jogo todo]})."""
+    hoje = agora().strftime("%Y%m%d")
+    g = memoria.get("hist_merge")
+    if not g or g["dia"] != hoje:
+        g = {"dia": hoje, "1t": {}, "ft": {}, "slugs": set()}
+        memoria["hist_merge"] = g
+
+    def tot(chave: str, tid: str) -> list:
+        return [x for _, x in sorted(g[chave].get(tid, []), reverse=True)[:HIST_JOGOS]]
+
+    def coberto() -> bool:
+        return all(len(tot("1t", i)) >= MIN_JOGOS_HIST or len(tot("ft", i)) >= MIN_JOGOS_HIST
+                   for i in ids)
+
+    for slug in LIGAS + [x for x in HIST_EXTRA if x not in LIGAS]:
+        if coberto():
+            break
+        if slug in g["slugs"]:
+            continue
+        h = carregar_historico(slug, memoria)
+        if not h:
+            continue
+        g["slugs"].add(slug)
+        for chave in ("1t", "ft"):
+            for tid, lista in h[chave].items():
+                g[chave].setdefault(tid, []).extend(lista)
+    return ({i: tot("1t", i) for i in ids}, {i: tot("ft", i) for i in ids})
+
+
+def inicio_dt(j: Jogo) -> Optional[datetime]:
+    try:
+        dt = datetime.fromisoformat(j.inicio.replace("Z", "+00:00"))
+        return dt if dt.tzinfo else dt.replace(tzinfo=None).astimezone()
+    except (ValueError, AttributeError):
+        return None
 
 
 def hora_local(iso: str) -> str:
@@ -926,7 +968,8 @@ def montar_prelive(slug: str, memoria: dict, dia: Optional[str] = None) -> Optio
     """Texto do pré-live de UMA liga (None se não há jogos por começar).
     dia = 'AAAAMMDD' para outra data (ex.: amanhã); None = hoje."""
     diag = memoria.setdefault("diag", {})          # guarda o que aconteceu, para explicar ao usuário
-    dados = get_espn(f"{slug}/scoreboard" + (f"?dates={dia}" if dia else ""))
+    alvo = dia or agora().strftime("%Y%m%d")          # sempre pede o dia explicitamente
+    dados = get_espn(f"{slug}/scoreboard?dates={alvo}")
     if dados is None:
         diag[slug] = (slug, 0, 0, False)
         return None
@@ -937,14 +980,24 @@ def montar_prelive(slug: str, memoria: dict, dia: Optional[str] = None) -> Optio
         j = parse_evento(ev, slug, rotulo)
         if j:
             todos.append(j)
-    jogos = [j for j in todos if j.estado == "pre"]
-    diag[slug] = (rotulo, len(todos), len(jogos), True)
+    agora_utc = datetime.now().astimezone()
+    do_dia, jogos = [], []
+    for j in todos:
+        dt = inicio_dt(j)
+        if dt is not None:
+            local = dt.astimezone(TZ) if TZ else dt.astimezone()
+            if local.strftime("%Y%m%d") != alvo:
+                continue                               # jogo de outro dia: ignora
+        do_dia.append(j)
+        if j.estado == "pre" and (dt is None or dt > agora_utc):
+            jogos.append(j)                            # ainda não começou
+    diag[slug] = (rotulo, len(do_dia), len(jogos), True)
     if not jogos:
         return None
     sufixo = " (amanhã)" if dia else ""
 
-    hist = carregar_historico(slug, memoria) or {}     # sem histórico: ainda lista os jogos
-    h1, hft = hist.get("1t", {}), hist.get("ft", {})
+    ids = {j.id_mandante for j in jogos} | {j.id_visitante for j in jogos}
+    h1, hft = historico_para(memoria, ids)             # junta ligas até cobrir os times
 
     linhas, sem_dados = [], 0
     for j in jogos:
@@ -969,11 +1022,9 @@ def montar_prelive(slug: str, memoria: dict, dia: Optional[str] = None) -> Optio
         out.append("Sem histórico suficiente para ranquear. Jogos por começar:")
         for j in jogos[:10]:
             out.append(f"• {esc(j.mandante)} x {esc(j.visitante)} · {hora_local(j.inicio)}")
-        info = memoria.get("hist_info", {}).get(slug)
-        if info:
-            out += ["", f"ℹ️ Diagnóstico: {info[0]} jogos lidos, {info[1]} finalizados, {info[2]} com gols do 1T."]
-        else:
-            out += ["", "ℹ️ Diagnóstico: a ESPN não devolveu o histórico agora."]
+        cobertos = sum(1 for i in ids if len(h1.get(i, [])) >= MIN_JOGOS_HIST
+                       or len(hft.get(i, [])) >= MIN_JOGOS_HIST)
+        out += ["", f"ℹ️ Diagnóstico: histórico suficiente para {cobertos} de {len(ids)} times."]
         return "\n".join(out)
 
     estimado = False
