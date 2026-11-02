@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*
+# -*- coding: utf-8 -*-
 """
 ==========================================================================
  BOT DE FUTEBOL AO VIVO -> TELEGRAM  (Gols e Cartões Vermelhos)
@@ -90,6 +90,7 @@ PRELIVE_TOP = int(os.getenv("PRELIVE_TOP", "3"))          # jogos por liga
 HIST_DIAS = int(os.getenv("HIST_DIAS", "45"))             # quantos dias olhar para trás
 HIST_JOGOS = int(os.getenv("HIST_JOGOS", "10"))           # últimos N jogos de cada time
 MIN_JOGOS_HIST = int(os.getenv("MIN_JOGOS_HIST", "4"))    # mínimo de jogos para entrar no ranking
+FATOR_1T = float(os.getenv("FATOR_1T", "0.45"))           # ~45% dos gols saem no 1T (usado só como estimativa)
 
 ARQUIVO_ESTADO = os.getenv("ARQUIVO_ESTADO", "estado_bot.json")
 # A ESPN tem mais de um endereço; se um bloquear (HTTP 403), tentamos o outro.
@@ -799,7 +800,7 @@ def gols_1t_por_lances(comp: dict, casa: dict, fora: dict) -> Optional[int]:
 
 
 def parse_passado(ev: dict) -> Optional[tuple]:
-    """Jogo terminado -> (data, id_casa, id_fora, total_de_gols_no_1T)."""
+    """Jogo terminado -> (data, id_casa, id_fora, gols_no_1T_ou_None, gols_no_jogo_todo)."""
     try:
         comp = ev["competitions"][0]
         status = ev.get("status") or comp.get("status") or {}
@@ -813,69 +814,69 @@ def parse_passado(ev: dict) -> Optional[tuple]:
                 fora = c
         if not casa or not fora:
             return None
+        if casa.get("score") is None or fora.get("score") is None:
+            return None
         hc, hf = gols_1t(casa), gols_1t(fora)
         if hc is not None and hf is not None:
-            total = hc + hf
+            total_1t = hc + hf
         else:
-            total = gols_1t_por_lances(comp, casa, fora)
-            if total is None:
-                return None
-        return (ev.get("date", ""), str(casa["team"]["id"]), str(fora["team"]["id"]), total)
+            total_1t = gols_1t_por_lances(comp, casa, fora)      # pode ser None
+        total_ft = _int(casa.get("score")) + _int(fora.get("score"))
+        return (ev.get("date", ""), str(casa["team"]["id"]), str(fora["team"]["id"]), total_1t, total_ft)
     except (KeyError, IndexError, TypeError, AttributeError):
         return None
 
 
-def _eventos_intervalo(slug: str, ini, fim, memoria: dict, orcamento: list) -> Optional[list]:
-    """Eventos da ESPN entre duas datas. Se a ESPN recusar (HTTP 400), tenta sem 'limit'
-    e depois divide o intervalo ao meio. 'orcamento' limita o total de tentativas."""
-    a, b = ini.strftime("%Y%m%d"), fim.strftime("%Y%m%d")
-    datas = a if ini == fim else f"{a}-{b}"
-    variantes = ("&limit=300", "") if memoria.get("usar_limit", True) else ("",)
-    for k, sufixo in enumerate(variantes):
-        if orcamento[0] <= 0:
-            return None
-        orcamento[0] -= 1
-        dados = get_espn(f"{slug}/scoreboard?dates={datas}{sufixo}")
-        if dados is not None:
-            if sufixo == "" and k > 0:
-                memoria["usar_limit"] = False        # lembra: esta ESPN não aceita 'limit'
-            return dados.get("events", [])
-    if ini == fim:
-        return []                                     # dia problemático: ignora
-    meio = ini + (fim - ini) // 2
-    esq = _eventos_intervalo(slug, ini, meio, memoria, orcamento)
-    dir_ = _eventos_intervalo(slug, meio + timedelta(days=1), fim, memoria, orcamento)
-    if esq is None and dir_ is None:
-        return None
-    return (esq or []) + (dir_ or [])
-
-
 def carregar_historico(slug: str, memoria: dict) -> Optional[dict]:
-    """{id_time: [gols_totais_no_1T dos últimos jogos]}; guardado em cache por dia."""
+    """Histórico recente de uma liga, em cache por dia:
+    {"1t": {id_time: [gols no 1T]}, "ft": {id_time: [gols no jogo todo]}}.
+    Busca do dia mais NOVO para o mais antigo, em blocos. Se a ESPN recusar (HTTP 400),
+    tenta sem 'limit' e depois encolhe o bloco (o tamanho que funciona fica memorizado)."""
     hoje_dt = agora().date()
     hoje = hoje_dt.strftime("%Y%m%d")
     cache = memoria.setdefault("hist", {})
     if slug in cache and cache[slug][0] == hoje:
         return cache[slug][1]
 
-    orcamento = [30]                                   # máx. de consultas por liga
+    limite_antigo = hoje_dt - timedelta(days=HIST_DIAS)
+    orcamento = 70                                     # máx. de consultas por liga
+    consultas = 0
+    falhas_seguidas = 0
     eventos: list = []
-    cursor = hoje_dt - timedelta(days=HIST_DIAS)
-    falhou = False
-    while cursor <= hoje_dt:                           # blocos de 10 dias
-        bloco_fim = min(cursor + timedelta(days=9), hoje_dt)
-        evs = _eventos_intervalo(slug, cursor, bloco_fim, memoria, orcamento)
+    cursor = hoje_dt
+    while cursor >= limite_antigo and orcamento > 0 and falhas_seguidas < 5:
+        span = memoria.get("span", 10)
+        ini = max(cursor - timedelta(days=span - 1), limite_antigo)
+        datas = ini.strftime("%Y%m%d") if ini == cursor else f"{ini:%Y%m%d}-{cursor:%Y%m%d}"
+        variantes = ("&limit=300", "") if memoria.get("usar_limit", True) else ("",)
+        evs = None
+        for k, sufixo in enumerate(variantes):
+            if orcamento <= 0:
+                break
+            orcamento -= 1
+            consultas += 1
+            dados = get_espn(f"{slug}/scoreboard?dates={datas}{sufixo}")
+            if dados is not None:
+                evs = dados.get("events", [])
+                if sufixo == "" and k > 0:
+                    memoria["usar_limit"] = False      # esta ESPN não aceita 'limit'
+                break
         if evs is None:
-            falhou = True
-        else:
-            eventos.extend(evs)
-        cursor = bloco_fim + timedelta(days=1)
+            if span > 1:
+                memoria["span"] = max(1, span // 2)    # bloco menor na próxima tentativa
+                continue
+            falhas_seguidas += 1
+            cursor -= timedelta(days=1)                # dia problemático: pula
+            continue
+        falhas_seguidas = 0
+        eventos.extend(evs)
+        cursor = ini - timedelta(days=1)
         time.sleep(PAUSA_ENTRE_REQUISICOES)
-    if not eventos and falhou:
-        return None                                    # não guarda no cache: tenta de novo depois
 
-    brutos: dict = {}
+    brutos_1t: dict = {}
+    brutos_ft: dict = {}
     vistos = set()
+    finalizados = com_1t = 0
     for ev in eventos:
         if ev.get("id") in vistos:
             continue
@@ -883,16 +884,33 @@ def carregar_historico(slug: str, memoria: dict) -> Optional[dict]:
         p = parse_passado(ev)
         if not p:
             continue
-        data, id_casa, id_fora, total = p
-        brutos.setdefault(id_casa, []).append((data, total))
-        brutos.setdefault(id_fora, []).append((data, total))
+        finalizados += 1
+        data, id_casa, id_fora, total_1t, total_ft = p
+        for tid in (id_casa, id_fora):
+            brutos_ft.setdefault(tid, []).append((data, total_ft))
+            if total_1t is not None:
+                brutos_1t.setdefault(tid, []).append((data, total_1t))
+        if total_1t is not None:
+            com_1t += 1
 
-    times = {}
-    for tid, lista in brutos.items():
-        lista.sort(reverse=True)                       # mais recentes primeiro
-        times[tid] = [t for _, t in lista[:HIST_JOGOS]]
-    cache[slug] = (hoje, times)
-    return times
+    memoria.setdefault("hist_info", {})[slug] = (len(vistos), finalizados, com_1t, consultas,
+                                                 memoria.get("span", 10))
+    log.info("Histórico %s: %d eventos lidos, %d finalizados, %d com gols do 1T "
+             "(consultas=%d, bloco=%d dias).",
+             slug, len(vistos), finalizados, com_1t, consultas, memoria.get("span", 10))
+    if not eventos:
+        return None                                    # não guarda no cache: tenta de novo depois
+
+    def ultimos(brutos: dict) -> dict:
+        out = {}
+        for tid, lista in brutos.items():
+            lista.sort(reverse=True)                   # mais recentes primeiro
+            out[tid] = [t for _, t in lista[:HIST_JOGOS]]
+        return out
+
+    resultado = {"1t": ultimos(brutos_1t), "ft": ultimos(brutos_ft)}
+    cache[slug] = (hoje, resultado)
+    return resultado
 
 
 def hora_local(iso: str) -> str:
@@ -925,37 +943,55 @@ def montar_prelive(slug: str, memoria: dict, dia: Optional[str] = None) -> Optio
         return None
     sufixo = " (amanhã)" if dia else ""
 
-    hist = carregar_historico(slug, memoria)
-    if hist is None:
-        hist = {}                  # sem histórico: o bot ainda lista os jogos (sem ranking)
+    hist = carregar_historico(slug, memoria) or {}     # sem histórico: ainda lista os jogos
+    h1, hft = hist.get("1t", {}), hist.get("ft", {})
 
     linhas, sem_dados = [], 0
     for j in jogos:
-        a, b = hist.get(j.id_mandante, []), hist.get(j.id_visitante, [])
-        if len(a) < MIN_JOGOS_HIST or len(b) < MIN_JOGOS_HIST:
-            sem_dados += 1
+        a1, b1 = h1.get(j.id_mandante, []), h1.get(j.id_visitante, [])
+        if len(a1) >= MIN_JOGOS_HIST and len(b1) >= MIN_JOGOS_HIST:
+            ma, mb = sum(a1) / len(a1), sum(b1) / len(b1)
+            pa = sum(1 for x in a1 if x >= 1) / len(a1) * 100
+            pb = sum(1 for x in b1 if x >= 1) / len(b1) * 100
+            linhas.append(((ma + mb) / 2, (pa + pb) / 2, j, ma, mb, pa, pb, False))
             continue
-        ma, mb = sum(a) / len(a), sum(b) / len(b)
-        pa = sum(1 for x in a if x >= 1) / len(a) * 100
-        pb = sum(1 for x in b if x >= 1) / len(b) * 100
-        linhas.append(((ma + mb) / 2, (pa + pb) / 2, j, ma, mb, pa, pb))
+        af, bf = hft.get(j.id_mandante, []), hft.get(j.id_visitante, [])
+        if len(af) >= MIN_JOGOS_HIST and len(bf) >= MIN_JOGOS_HIST:
+            fa, fb = sum(af) / len(af), sum(bf) / len(bf)   # gols por jogo (jogo todo)
+            linhas.append(((fa + fb) / 2 * FATOR_1T, 0.0, j, fa, fb, None, None, True))
+            continue
+        sem_dados += 1
     linhas.sort(key=lambda x: (x[0], x[1]), reverse=True)
 
-    log.info("Pré-live %s: %d jogo(s) por começar, %d com histórico suficiente (%d times com dados).",
-             slug, len(jogos), len(linhas), len(hist))
+    log.info("Pré-live %s: %d jogo(s) por começar, %d ranqueado(s).", slug, len(jogos), len(linhas))
     out = [f"🔮 <b>PRÉ-LIVE — {esc(rotulo)}{sufixo}</b>", "Chance de gol no 1º tempo", ""]
     if not linhas:
-        out.append("Sem histórico suficiente de gols no 1T para ranquear. Jogos por começar:")
+        out.append("Sem histórico suficiente para ranquear. Jogos por começar:")
         for j in jogos[:10]:
             out.append(f"• {esc(j.mandante)} x {esc(j.visitante)} · {hora_local(j.inicio)}")
+        info = memoria.get("hist_info", {}).get(slug)
+        if info:
+            out += ["", f"ℹ️ Diagnóstico: {info[0]} jogos lidos, {info[1]} finalizados, {info[2]} com gols do 1T."]
+        else:
+            out += ["", "ℹ️ Diagnóstico: a ESPN não devolveu o histórico agora."]
         return "\n".join(out)
-    for i, (media, pct, j, ma, mb, pa, pb) in enumerate(linhas[:PRELIVE_TOP], 1):
+
+    estimado = False
+    for i, (media, pct, j, ma, mb, pa, pb, est) in enumerate(linhas[:PRELIVE_TOP], 1):
         out.append(f"<b>{i}. {esc(j.mandante)} x {esc(j.visitante)}</b> · {hora_local(j.inicio)}")
-        out.append(f"   Média de gols no 1T: <b>{media:.2f}</b> ({ma:.1f} | {mb:.1f})")
-        out.append(f"   Jogos com gol no 1T: {pa:.0f}% | {pb:.0f}%")
+        if est:
+            estimado = True
+            out.append(f"   Gols por jogo: {ma:.1f} | {mb:.1f} → ≈ <b>{media:.2f}</b> no 1T")
+        else:
+            out.append(f"   Média de gols no 1T: <b>{media:.2f}</b> ({ma:.1f} | {mb:.1f})")
+            out.append(f"   Jogos com gol no 1T: {pa:.0f}% | {pb:.0f}%")
     out.append("")
-    out.append(f"ℹ️ Base: últimos {HIST_JOGOS} jogos de cada time. Estatística, não garantia."
-               + (f" ({sem_dados} jogo(s) sem dados suficientes)" if sem_dados else ""))
+    nota = f"ℹ️ Base: últimos {HIST_JOGOS} jogos de cada time. Estatística, não garantia."
+    if estimado:
+        nota += " ≈ = estimado pelos gols do jogo todo (a ESPN não trouxe o 1T)."
+    if sem_dados:
+        nota += f" ({sem_dados} jogo(s) sem dados suficientes)"
+    out.append(nota)
     return "\n".join(out)
 
 
