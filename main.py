@@ -48,12 +48,12 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "COLE_SEU_TOKEN_AQUI")
 CHAT_ID = os.getenv("CHAT_ID", "COLE_SEU_CHAT_ID_AQUI")
 TIMEZONE = os.getenv("TIMEZONE", "America/Sao_Paulo")
 
-# Adicionada a Albânia (alb.1) no início para o teste das 09:30
+# Coreia do Sul (kor.1) adicionada para os testes matutinos
 LIGAS = [
     s.strip()
     for s in os.getenv(
         "LIGAS",
-        "alb.1,bra.1,eng.1,esp.1,ita.1,ger.1,fra.1,por.1,"
+        "kor.1,bra.1,eng.1,esp.1,ita.1,ger.1,fra.1,por.1,"
         "uefa.champions,uefa.europa,conmebol.libertadores",
     ).split(",")
     if s.strip()
@@ -1124,7 +1124,7 @@ def main() -> None:
 
     enviar_telegram(
         "🤖 <b>Bot iniciado!</b>\n"
-        f"Ligas monitoradas: {len(LIGAS)} (incluindo Superliga Albânia)\n"
+        f"Ligas monitoradas: {len(LIGAS)} (incluindo K-League Coreia)\n"
         "Alerta ao vivo: 🔥 CHANCE DE GOL (jogo todo)\n"
         "Envie /prelive no chat do bot para ver os jogos da manhã!"
     )
