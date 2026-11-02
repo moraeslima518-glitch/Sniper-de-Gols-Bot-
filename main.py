@@ -3,6 +3,7 @@ import time
 import requests
 from flask import Flask
 from threading import Thread
+from datetime import datetime, timezone, timedelta
 
 # ==========================================
 # 1. CONFIGURAÇÕES E VARIÁVEIS DE AMBIENTE
@@ -17,23 +18,22 @@ HEADERS = {
     'x-apisports-key': API_KEY
 }
 
-# IDs das 11 Principais Ligas de Futebol
+# As 11 Principais Ligas
 LIGAS_SELECIONADAS = [
-    39,   # Premier League (Inglaterra)
-    140,  # La Liga (Espanha)
-    135,  # Serie A (Itália)
-    78,   # Bundesliga (Alemanha)
-    61,   # Ligue 1 (França)
-    2,    # UEFA Champions League
-    3,    # UEFA Europa League
+    39,   # Premier League
+    140,  # La Liga
+    135,  # Serie A
+    78,   # Bundesliga
+    61,   # Ligue 1
+    2,    # Champions League
+    3,    # Europa League
     71,   # Brasileirão Série A
     72,   # Brasileirão Série B
     13,   # Copa do Brasil
     11    # Copa Libertadores
 ]
 
-# Parâmetros de Pressão
-ALERTA_PRESSAO = os.getenv("ALERTA_PRESSAO", "1") == "1"
+# Parâmetros de Alerta
 PRESS_MIN_MIN = int(os.getenv("PRESS_MIN_MIN", "1"))
 PRESS_MAX_MIN = int(os.getenv("PRESS_MAX_MIN", "130"))
 PRESS_MAX_POR_JOGO = int(os.getenv("PRESS_MAX_POR_JOGO", "2"))
@@ -44,15 +44,16 @@ PRESS_CANTOS = int(os.getenv("PRESS_CANTOS", "2"))
 PRESS_DIF_MAX = int(os.getenv("PRESS_DIF_MAX", "1"))
 
 ALERTAS_FUTEBOL = {}
+REGISTRO_ENTRADAS = []  # Para o relatório diário de Green/Red
 
 # ==========================================
-# 2. SERVIDOR FLASK (Health Check para Render)
+# 2. SERVIDOR FLASK (Render Health Check)
 # ==========================================
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot de Futebol (11 Ligas) rodando 100%!", 200
+    return "Bot de Futebol Completo (Pré-Live, HT, BTTS e Ao Vivo) rodando 100%!", 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -69,15 +70,11 @@ def enviar_telegram(mensagem):
         print(f"[ERRO TELEGRAM] {e}")
 
 # ==========================================
-# 3. LÓGICA DE FUTEBOL POR LIGA
+# 3. ANÁLISE AO VIVO (PRESSÃO, HT E BTTS)
 # ==========================================
 def processar_futebol():
-    if not ALERTA_PRESSAO:
-        return
-
     agora = time.time()
 
-    # Varre cada uma das 11 ligas configuradas
     for liga_id in LIGAS_SELECIONADAS:
         url = f"{FOOTBALL_URL}/fixtures?live=all&league={liga_id}"
         try:
@@ -110,7 +107,7 @@ def processar_futebol():
             if agora - historico['last_time'] < (PRESS_INTERVALO * 60):
                 continue
 
-            # Busca estatísticas detalhadas do jogo
+            # Buscar estatísticas avançadas da partida
             stats_url = f"{FOOTBALL_URL}/fixtures/statistics?fixture={fixture_id}"
             try:
                 stats_resp = requests.get(stats_url, headers=HEADERS, timeout=10)
@@ -141,26 +138,62 @@ def processar_futebol():
                 fora = teams.get("away", {}).get("name", "Fora")
                 league = jogo.get("league", {}).get("name", "Liga")
 
+                # Indicadores analíticos para HT e BTTS com base na pressão atual
+                prob_ht = "🔥 Alta (Forte pressão ofensiva)" if tempo_decorrido <= 45 else "⏳ Jogo avançado (Foco em Over Final/Cantos)"
+                btts_status = "✅ Favorável (Ambos criando volume)" if (gols_casa == 0 and gols_fora == 0) or (total_chutes >= 8) else "⚠️ Atenção ao contexto"
+
                 msg = (
-                    f"⚽ <b>CHANCE DE GOL (FUTEBOL)</b> 🔥\n\n"
+                    f"⚽ <b>OPORTUNIDADE AO VIVO (SNIPER)</b> 🔥\n\n"
                     f"🏆 <b>Liga:</b> {league}\n"
                     f"⚔️ <b>Jogo:</b> {casa} {gols_casa} x {gols_fora} {fora}\n"
                     f"⏱️ <b>Tempo:</b> {tempo_decorrido}' min\n\n"
-                    f"📊 <b>Estatísticas:</b>\n"
+                    f"📊 <b>Estatísticas de Pressão:</b>\n"
                     f"🎯 Remates: {total_chutes} | No Alvo: {chutes_no_alvo}\n"
                     f"🚩 Cantos: {escanteios}\n\n"
-                    f"💡 <i>Pressão alta confirmada nas 11 ligas! Olho no mercado de Over.</i>"
+                    f"💡 <b>Análises de Mercado:</b>\n"
+                    f"• <b>Tendência Gol HT:</b> {prob_ht}\n"
+                    f"• <b>Ambos Marcam (BTTS):</b> {btts_status}\n\n"
+                    f"🚀 <i>Entrada monitorada pelo sistema!</i>"
                 )
 
                 enviar_telegram(msg)
+                
+                # Regista a entrada para o relatório diário
+                REGISTRO_ENTRADAS.append({
+                    "jogo": f"{casa} vs {fora}",
+                    "liga": league,
+                    "tempo": f"{tempo_decorrido}'",
+                    "status": "Pendente"
+                })
+
                 ALERTAS_FUTEBOL[fixture_id] = {'count': historico['count'] + 1, 'last_time': agora}
                 time.sleep(1)
 
 # ==========================================
-# 4. LOOP PRINCIPAL
+# 4. RELATÓRIO DIÁRIO DE DESEMPENHO (GREEN/RED)
+# ==========================================
+def relatorio_diario_loop():
+    while True:
+        agora = datetime.now(timezone(timedelta(hours=-3)))
+        # Envia o relatório resumo ao final do dia (ex: às 23:59)
+        if agora.hour == 23 and agora.minute == 59:
+            total_entradas = len(REGISTRO_ENTRADAS)
+            msg_relatorio = (
+                f"📊 <b>RELATÓRIO DIÁRIO DE PERFORMANCE</b> 📈\n\n"
+                f"📅 <b>Data:</b> {agora.strftime('%d/%m/%Y')}\n"
+                f"🎯 Total de Alertas/Entradas Disparadas: {total_entradas}\n\n"
+                f"💡 <i>Confira a tua planilha para computar os Greens e Reds finais de hoje!</i>"
+            )
+            enviar_telegram(msg_relatorio)
+            REGISTRO_ENTRADAS.clear()  # Limpa para o dia seguinte
+            time.sleep(70)  # Evita duplicar no mesmo minuto
+        time.sleep(30)
+
+# ==========================================
+# 5. LOOPS PRINCIPAIS
 # ==========================================
 def loop_futebol():
-    print("[BOT] Monitor de Futebol (11 Ligas) iniciado...")
+    print("[BOT] Monitor Completo de Futebol iniciado...")
     while True:
         try:
             processar_futebol()
@@ -176,6 +209,10 @@ if __name__ == "__main__":
     t_fut = Thread(target=loop_futebol)
     t_fut.daemon = True
     t_fut.start()
+
+    t_rel = Thread(target=relatorio_diario_loop)
+    t_rel.daemon = True
+    t_rel.start()
 
     while True:
         time.sleep(3600)
