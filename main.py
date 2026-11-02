@@ -4,6 +4,7 @@ import requests
 from flask import Flask
 from threading import Thread
 from datetime import datetime, timezone, timedelta
+import telebot
 
 # ==========================================
 # 1. CONFIGURAÇÕES E VARIÁVEIS DE AMBIENTE
@@ -45,6 +46,10 @@ PRESS_DIF_MAX = int(os.getenv("PRESS_DIF_MAX", "1"))
 
 ALERTAS_FUTEBOL = {}
 REGISTRO_ENTRADAS = []  # Para o relatório diário de Green/Red
+TEMPO_INICIO = time.time()
+
+# Instância do Bot Telegram para escutar comandos
+bot = telebot.TeleBot(TELEGRAM_TOKEN) if TELEGRAM_TOKEN else None
 
 # ==========================================
 # 2. SERVIDOR FLASK (Render Health Check)
@@ -53,7 +58,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Bot de Futebol Completo (Pré-Live, HT, BTTS e Ao Vivo) rodando 100%!", 200
+    return "Bot de Futebol Completo com Comandos rodando 100%!", 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
@@ -70,7 +75,63 @@ def enviar_telegram(mensagem):
         print(f"[ERRO TELEGRAM] {e}")
 
 # ==========================================
-# 3. ANÁLISE AO VIVO (PRESSÃO, HT E BTTS)
+# 3. COMANDOS INTERATIVOS NO TELEGRAM
+# ==========================================
+if bot:
+    @bot.message_handler(commands=['status'])
+    def cmd_status(message):
+        uptime_segundos = int(time.time() - TEMPO_INICIO)
+        horas = uptime_segundos // 3600
+        minutos = (uptime_segundos % 3600) // 60
+        
+        texto = (
+            f"🤖 <b>STATUS DO BOT SNIPER</b>\n\n"
+            f"✅ <b>Estado:</b> Online e Operacional\n"
+            f"⏱️ <b>Tempo Ligado:</b> {horas}h {minutos}m\n"
+            f"🏆 <b>Ligas Monitorizadas:</b> {len(LIGAS_SELECIONADAS)} competições\n"
+            f"📊 <b>Entradas Registadas Hoje:</b> {len(REGISTRO_ENTRADAS)}"
+        )
+        bot.reply_to(message, texto, parse_mode="HTML")
+
+    @bot.message_handler(commands=['jogos'])
+    def cmd_jogos(message):
+        bot.reply_to(message, "🔍 A varrer os jogos ao vivo nas 11 ligas, aguarda um momento...", parse_mode="HTML")
+        jogos_ativos = 0
+        resposta_txt = "⚽ <b>JOGOS AO VIVO NAS 11 LIGAS:</b>\n\n"
+
+        for liga_id in LIGAS_SELECIONADAS:
+            url = f"{FOOTBALL_URL}/fixtures?live=all&league={liga_id}"
+            try:
+                res = requests.get(url, headers=HEADERS, timeout=10)
+                if res.status_code == 200:
+                    partidas = res.json().get("response", [])
+                    for p in partidas:
+                        casa = p.get("teams", {}).get("home", {}).get("name", "")
+                        fora = p.get("teams", {}).get("away", {}).get("name", "")
+                        g_casa = p.get("goals", {}).get("home", 0)
+                        g_fora = p.get("goals", {}).get("away", 0)
+                        tempo = p.get("fixture", {}).get("status", {}).get("elapsed", 0)
+                        liga_nome = p.get("league", {}).get("name", "")
+                        
+                        resposta_txt += f"• [{liga_nome}] {casa} {g_casa} x {g_fora} {fora} ({tempo}')\n"
+                        jogos_ativos += 1
+            except:
+                continue
+
+        if jogos_ativos == 0:
+            resposta_txt += "Nenhum jogo destas ligas a decorrer neste exato momento."
+        
+        bot.reply_to(message, resposta_txt[:4000], parse_mode="HTML")
+
+    def run_bot_listener():
+        print("[BOT TELEGRAM] Ouvindo comandos...")
+        try:
+            bot.infinity_polling(timeout=10, long_polling_timeout=5)
+        except Exception as e:
+            print(f"[ERRO POLLING TELEGRAM] {e}")
+
+# ==========================================
+# 4. ANÁLISE AO VIVO (PRESSÃO, HT E BTTS)
 # ==========================================
 def processar_futebol():
     agora = time.time()
@@ -138,7 +199,6 @@ def processar_futebol():
                 fora = teams.get("away", {}).get("name", "Fora")
                 league = jogo.get("league", {}).get("name", "Liga")
 
-                # Indicadores analíticos para HT e BTTS com base na pressão atual
                 prob_ht = "🔥 Alta (Forte pressão ofensiva)" if tempo_decorrido <= 45 else "⏳ Jogo avançado (Foco em Over Final/Cantos)"
                 btts_status = "✅ Favorável (Ambos criando volume)" if (gols_casa == 0 and gols_fora == 0) or (total_chutes >= 8) else "⚠️ Atenção ao contexto"
 
@@ -158,7 +218,6 @@ def processar_futebol():
 
                 enviar_telegram(msg)
                 
-                # Regista a entrada para o relatório diário
                 REGISTRO_ENTRADAS.append({
                     "jogo": f"{casa} vs {fora}",
                     "liga": league,
@@ -170,12 +229,11 @@ def processar_futebol():
                 time.sleep(1)
 
 # ==========================================
-# 4. RELATÓRIO DIÁRIO DE DESEMPENHO (GREEN/RED)
+# 5. RELATÓRIO DIÁRIO DE DESEMPENHO
 # ==========================================
 def relatorio_diario_loop():
     while True:
         agora = datetime.now(timezone(timedelta(hours=-3)))
-        # Envia o relatório resumo ao final do dia (ex: às 23:59)
         if agora.hour == 23 and agora.minute == 59:
             total_entradas = len(REGISTRO_ENTRADAS)
             msg_relatorio = (
@@ -185,12 +243,12 @@ def relatorio_diario_loop():
                 f"💡 <i>Confira a tua planilha para computar os Greens e Reds finais de hoje!</i>"
             )
             enviar_telegram(msg_relatorio)
-            REGISTRO_ENTRADAS.clear()  # Limpa para o dia seguinte
-            time.sleep(70)  # Evita duplicar no mesmo minuto
+            REGISTRO_ENTRADAS.clear()
+            time.sleep(70)
         time.sleep(30)
 
 # ==========================================
-# 5. LOOPS PRINCIPAIS
+# 6. LOOPS PRINCIPAIS
 # ==========================================
 def loop_futebol():
     print("[BOT] Monitor Completo de Futebol iniciado...")
@@ -213,6 +271,11 @@ if __name__ == "__main__":
     t_rel = Thread(target=relatorio_diario_loop)
     t_rel.daemon = True
     t_rel.start()
+
+    if bot:
+        t_bot = Thread(target=run_bot_listener)
+        t_bot.daemon = True
+        t_bot.start()
 
     while True:
         time.sleep(3600)
