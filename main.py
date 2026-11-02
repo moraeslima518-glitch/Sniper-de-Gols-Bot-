@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*
 """
 ==========================================================================
  BOT DE FUTEBOL AO VIVO -> TELEGRAM  (Gols e Cartões Vermelhos)
@@ -825,20 +825,61 @@ def parse_passado(ev: dict) -> Optional[tuple]:
         return None
 
 
+def _eventos_intervalo(slug: str, ini, fim, memoria: dict, orcamento: list) -> Optional[list]:
+    """Eventos da ESPN entre duas datas. Se a ESPN recusar (HTTP 400), tenta sem 'limit'
+    e depois divide o intervalo ao meio. 'orcamento' limita o total de tentativas."""
+    a, b = ini.strftime("%Y%m%d"), fim.strftime("%Y%m%d")
+    datas = a if ini == fim else f"{a}-{b}"
+    variantes = ("&limit=300", "") if memoria.get("usar_limit", True) else ("",)
+    for k, sufixo in enumerate(variantes):
+        if orcamento[0] <= 0:
+            return None
+        orcamento[0] -= 1
+        dados = get_espn(f"{slug}/scoreboard?dates={datas}{sufixo}")
+        if dados is not None:
+            if sufixo == "" and k > 0:
+                memoria["usar_limit"] = False        # lembra: esta ESPN não aceita 'limit'
+            return dados.get("events", [])
+    if ini == fim:
+        return []                                     # dia problemático: ignora
+    meio = ini + (fim - ini) // 2
+    esq = _eventos_intervalo(slug, ini, meio, memoria, orcamento)
+    dir_ = _eventos_intervalo(slug, meio + timedelta(days=1), fim, memoria, orcamento)
+    if esq is None and dir_ is None:
+        return None
+    return (esq or []) + (dir_ or [])
+
+
 def carregar_historico(slug: str, memoria: dict) -> Optional[dict]:
     """{id_time: [gols_totais_no_1T dos últimos jogos]}; guardado em cache por dia."""
-    hoje = agora().strftime("%Y%m%d")
+    hoje_dt = agora().date()
+    hoje = hoje_dt.strftime("%Y%m%d")
     cache = memoria.setdefault("hist", {})
     if slug in cache and cache[slug][0] == hoje:
         return cache[slug][1]
 
-    ini = (agora() - timedelta(days=HIST_DIAS)).strftime("%Y%m%d")
-    dados = get_espn(f"{slug}/scoreboard?dates={ini}-{hoje}&limit=500")
-    if dados is None:
-        return None
+    orcamento = [30]                                   # máx. de consultas por liga
+    eventos: list = []
+    cursor = hoje_dt - timedelta(days=HIST_DIAS)
+    falhou = False
+    while cursor <= hoje_dt:                           # blocos de 10 dias
+        bloco_fim = min(cursor + timedelta(days=9), hoje_dt)
+        evs = _eventos_intervalo(slug, cursor, bloco_fim, memoria, orcamento)
+        if evs is None:
+            falhou = True
+        else:
+            eventos.extend(evs)
+        cursor = bloco_fim + timedelta(days=1)
+        time.sleep(PAUSA_ENTRE_REQUISICOES)
+    if not eventos and falhou:
+        return None                                    # não guarda no cache: tenta de novo depois
 
     brutos: dict = {}
-    for ev in dados.get("events", []):
+    vistos = set()
+    for ev in eventos:
+        if ev.get("id") in vistos:
+            continue
+        vistos.add(ev.get("id"))
         p = parse_passado(ev)
         if not p:
             continue
@@ -886,7 +927,7 @@ def montar_prelive(slug: str, memoria: dict, dia: Optional[str] = None) -> Optio
 
     hist = carregar_historico(slug, memoria)
     if hist is None:
-        return f"🔮 <b>PRÉ-LIVE — {esc(rotulo)}{sufixo}</b>\nNão consegui o histórico agora. Tente de novo em instantes."
+        hist = {}                  # sem histórico: o bot ainda lista os jogos (sem ranking)
 
     linhas, sem_dados = [], 0
     for j in jogos:
@@ -951,6 +992,24 @@ def enviar_prelive(memoria: dict, dia: Optional[str] = None) -> None:
         enviar_telegram("\n".join(linhas))
 
 
+def prelive_em_segundo_plano(memoria: dict, dia: Optional[str] = None) -> None:
+    """Monta o pré-live numa thread, para não atrasar os alertas ao vivo."""
+    if memoria.get("prelive_rodando"):
+        enviar_telegram("⏳ O pré-live anterior ainda está sendo montado. Aguarde um instante.")
+        return
+    memoria["prelive_rodando"] = True
+
+    def tarefa() -> None:
+        try:
+            enviar_prelive(memoria, dia)
+        except Exception:
+            log.exception("Erro ao montar o pré-live.")
+        finally:
+            memoria["prelive_rodando"] = False
+
+    threading.Thread(target=tarefa, daemon=True).start()
+
+
 def verificar_prelive_auto(estado: dict, memoria: dict) -> None:
     if not PRELIVE_AUTO:
         return
@@ -962,7 +1021,7 @@ def verificar_prelive_auto(estado: dict, memoria: dict) -> None:
         return
     estado["ultimo_prelive"] = hoje      # marca antes: evita repetir se der erro no meio
     salvar_estado(estado)
-    enviar_prelive(memoria)
+    prelive_em_segundo_plano(memoria)
 
 
 def verificar_comandos(memoria: dict) -> None:
@@ -995,7 +1054,7 @@ def verificar_comandos(memoria: dict) -> None:
             if len(partes) > 1 and partes[1] in ("amanha", "amanhã"):
                 dia = (agora() + timedelta(days=1)).strftime("%Y%m%d")
             enviar_telegram("🔎 Montando o pré-live, um instante...")
-            enviar_prelive(memoria, dia)
+            prelive_em_segundo_plano(memoria, dia)
     if primeira and memoria.get("offset") is None:
         memoria["offset"] = 0
 
