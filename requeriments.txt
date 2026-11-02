@@ -1,4 +1,3 @@
 Pedidos>=2.31
 Dados
-flask
-requests
+
